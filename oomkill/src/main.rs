@@ -42,13 +42,12 @@ fn main() {
     })
     .expect("Failed to set handler for SIGINT / SIGTERM");
 
+    println!("Tracing OOM kills... Ctrl-C to stop.");
     if let Err(x) = do_main(runnable) {
         eprintln!("Error: {}", x);
         eprintln!("{}", x.backtrace());
         std::process::exit(1);
     }
-
-    println!("Hello, world!");
 }
 
 fn perf_data_callback() -> Box<dyn FnMut(&[u8]) + Send> {
@@ -56,13 +55,14 @@ fn perf_data_callback() -> Box<dyn FnMut(&[u8]) + Send> {
         let data = parse_struct(x);
         let now: DateTime<Utc> = Utc::now();
         println!(
-            "{} Triggered by PID {} {}, OOM kill of PID {} {}, {} pages",
+            "{} Triggered by PID {} {}, OOM kill of PID {} {}, {} pages, loadavg: {}",
             now.format("%H:%M:%S"),
             data.fpid,
             str::from_utf8(&data.fcomm).unwrap(),
             data.tpid,
             str::from_utf8(&data.tcomm).unwrap(),
-            data.pages
+            data.pages,
+            procfs::LoadAverage::new().unwrap().one
         );
     })
 }
