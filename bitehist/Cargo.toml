@@ -1,0 +1,12 @@
+[package]
+name = "bitesize"
+version = "0.1.0"
+authors = ["jbpratt78 <jbpratt78@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bcc = "0.0.17"
+ctrlc = { version = "3.0", features = ["termination"] }
+failure = "0.1.7"
