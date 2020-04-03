@@ -1,11 +1,16 @@
 extern crate ctrlc;
 extern crate page_size;
 
+#[macro_use]
+extern crate clap;
+
 use anyhow::{anyhow, Result};
-use clap::{App, Arg};
+use bcc::core::BPF;
+use clap::value_t;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Command, Stdio};
+use std::ptr;
 use std::sync::Arc;
 
 const DESCRIPTION: &'static str = r#"
@@ -15,116 +20,39 @@ allocations made with kmalloc/kmem_cache_alloc/get_free_pages and corresponding
 memory release functions."#;
 
 fn do_main(runn: Arc<AtomicBool>) -> Result<()> {
-    // TODO: reqork this to clap macro
-    let matches = App::new("memleak")
-        .about(DESCRIPTION)
-        .arg(Arg::with_name("ebpf").long("ebpf"))
-        .arg(
-            Arg::with_name("pid")
-                .short("p")
-                .long("pid")
-                .takes_value(true)
-                .help("the PID to trace; if not specified, trace kernel allocs"),
-        )
-        .arg(
-            Arg::with_name("trace")
-                .short("t")
-                .long("trace")
-                .help("print trace messages for each alloc/free call"),
-        )
-        .arg(
-            Arg::with_name("interval")
-                .short("n")
-                .long("interval")
-                .takes_value(true)
-                .help("interval in seconds to print outstanding allocations"),
-        )
-        .arg(
-            Arg::with_name("count")
-                .short("c")
-                .long("count")
-                .takes_value(true)
-                .help("execute and trace the specified command"),
-        )
-        .arg(
-            Arg::with_name("allocs")
-                .short("a")
-                .long("show-allocs")
-                .takes_value(true)
-                .help("show allocation addresses and sizes as well as call stacks"),
-        )
-        .arg(
-            Arg::with_name("older")
-                .short("o")
-                .long("older")
-                .takes_value(true)
-                .help("show allocation addresses and sizes as well as call stacks"),
-        )
-        .arg(
-            Arg::with_name("command")
-                .short("c")
-                .long("command")
-                .takes_value(true)
-                .help("execute and trace the specified command"),
-        )
-        .arg(
-            Arg::with_name("combined-only")
-                .long("combined-only")
-                .help("show combined allocation statistics only"),
-        )
-        .arg(
-            Arg::with_name("sample-rate")
-                .short("s")
-                .long("sample-rate")
-                .takes_value(true)
-                .help("sample every N-th allocation to decrease the overhead"),
-        )
-        .arg(
-            Arg::with_name("top")
-                .short("t")
-                .long("top")
-                .takes_value(true)
-                .help("display only this many top allocating stacks (by size)"),
-        )
-        .arg(
-            Arg::with_name("min-size")
-                .short("z")
-                .long("min-size")
-                .takes_value(true)
-                .help("capture only allocations larger than this size"),
-        )
-        .arg(
-            Arg::with_name("max-size")
-                .short("Z")
-                .long("max-size")
-                .takes_value(true)
-                .help("capture only allocations smaller than this size"),
-        )
-        .arg(
-            Arg::with_name("obj")
-                .short("o")
-                .long("obj")
-                .takes_value(true)
-                .help("attach to allocator functions in the specified object"),
-        )
-        .arg(
-            Arg::with_name("percpu")
-                .long("percpu")
-                .help("trace percpu allocations"),
-        )
-        .get_matches();
+    let matches = clap_app!(myapp =>
+        (about: DESCRIPTION)
+        (@arg ebpf: --ebpf)
+        (@arg pid: -p --pid +takes_value "the PID to trace; if not specified, trace kernel allocs")
+        (@arg trace: -t --trace "print trace messages for each alloc/free call")
+        (@arg interval: -n --interval +takes_value "interval in seconds to print outstanding allocations")
+        (@arg count: --count +takes_value "execute and trace the specified command")
+        (@arg allocs: -a --show_allows +takes_value "show allocation addresses and sizes as well as call stacks")
+        (@arg older: --older +takes_value "show allocation addresses and sizes as well as call stacks")
+        (@arg command: -c --command +takes_value "execute and trace the specified command")
+        (@arg combinedonly: --combined_only "show combined allocation statistics only")
+        (@arg samplerate: --sample_rate +takes_value "sample every N-th allocation to decrease the overhead")
+        (@arg top: -T --top +takes_value "display only this many top allocating stacks (by size)")
+        (@arg minsize: -z --min_size +takes_value "capture only allocations larger than this size")
+        (@arg maxsize: -Z --max_size +takes_value "capture only allocations smaller than this size")
+        (@arg obj: -O --obj +takes_value "attach to allocator functions in the specified object")
+        (@arg percpu: --percpu "trace percpu allocations")
+    )
+    .get_matches();
 
-    let mut source: String = bpf_source.clone().to_owned();
-    let pid = parse_i32_or(matches.value_of("pid"), -1);
+    let mut source: String = BPF_SOURCE.clone().to_owned();
     let trace_all: bool = matches.is_present("trace");
     let show_allocs: bool = matches.is_present("allocs");
-    let count: i32 = parse_i32_or(matches.value_of("count"), 0);
-    let older: i32 = parse_i32_or(matches.value_of("older"), 500);
+    let pid = value_t!(matches, "pid", i32).unwrap_or(-1);
+    let count = value_t!(matches, "count", i32).unwrap_or(0);
+    let older = value_t!(matches, "older", i32).unwrap_or(500);
+    let sample_every_n = value_t!(matches, "samplerate", i32).unwrap_or(-1);
+    let top = value_t!(matches, "top", i32).unwrap_or(10);
+    let min_size = value_t!(matches, "minsize", i32).unwrap_or(-1);
+    let max_size = value_t!(matches, "maxsize", i32).unwrap_or(-1);
+    let obj = value_t!(matches, "obj", String).unwrap_or(String::from("c"));
     let mut cmd_pid: u32 = 0;
-    let sample_every_n: i32 = parse_i32_or(matches.value_of("sample-rate"), 1);
-    let top: i32 = parse_i32_or(matches.value_of("top"), 10);
-    let min_size: i32 = parse_i32_or(matches.value_of("min-size"), -1);
-    let max_size: i32 = parse_i32_or(matches.value_of("max-size"), -1);
+    let kernel_trace: bool = pid == -1 && !matches.is_present("command");
 
     if min_size != -1 && max_size != -1 && min_size > max_size {
         return Err(anyhow!("min_size (-z) can't be greater than max_size (-Z)"));
@@ -157,22 +85,113 @@ fn do_main(runn: Arc<AtomicBool>) -> Result<()> {
     let source = source.replace("PAGE_SIZE", &page_size::get().to_string());
 
     let mut size_filter: String = String::new();
-    if matches.is_present("min-size") && matches.is_present("max-size") {
+    if matches.is_present("minsize") && matches.is_present("maxsize") {
         size_filter = format!("if (size < {} || size > {}) return 0;", min_size, max_size);
-    } else if matches.is_present("min-size") {
+    } else if matches.is_present("minsize") {
         size_filter = format!("if (size < {}) return 0;", min_size);
-    } else if matches.is_present("max-size") {
+    } else if matches.is_present("maxsize") {
         size_filter = format!("if (size > {}) return 0;", max_size);
     }
 
     let source = source.replace("SIZE_FILTER", &size_filter);
 
-    println!(
-        "{} {} {} {} {} {} {}",
-        pid, trace_all, show_allocs, count, older, cmd_pid, top
-    );
+    let mut stack_flags = String::from("0");
+    if !kernel_trace {
+        stack_flags.push_str("|BPF_F_USER_STACK");
+    }
 
-    println!("{}", source);
+    let source = source.replace("STACK_FLAGS", &stack_flags);
+
+    if matches.is_present("ebpf") {
+        println!("{}", source);
+    }
+
+    let mut bpf = BPF::new(&source).expect("failed to parse BPF source");
+
+    if !kernel_trace {
+        let pref = "malloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "calloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "realloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "posix_memalign".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "valloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "memalign".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "pvalloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        // TODO: can fail
+        let pref = "aligned_alloc".to_string();
+        let file_ent = bpf.load_uprobe(&(pref.clone() + "_enter")).unwrap();
+        let file_ex = bpf.load_uprobe(&(pref.clone() + "_exit")).unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+        bpf.attach_uretprobe(&obj, pref.as_str(), file_ex, pid)
+            .unwrap();
+
+        let pref = "free".to_string();
+        let file_ent = bpf.load_uprobe("free_enter").unwrap();
+        bpf.attach_uprobe(&obj, pref.as_str(), file_ent, pid)
+            .unwrap();
+    } else {
+        println!("Attaching to kernel allocators, Ctrl+C to quit.");
+    }
+
+    let table = bpf.table("allocs");
+    bpf.init_perf_map(table, print_allocs).unwrap();
+    //let table = bpf.table("stack_traces");
+    //bpf.init_perf_map(table, print_stack_traces).unwrap();
+    let table = bpf.table("combined_allocs");
+    bpf.init_perf_map(table, print_combined_allocs).unwrap();
+
+    while runn.load(Ordering::SeqCst) {
+        bpf.perf_map_poll(200);
+    }
 
     Ok(())
 }
@@ -190,14 +209,22 @@ fn main() {
     }
 }
 
-fn parse_i32_or(inp: Option<&str>, default: i32) -> i32 {
-    match inp {
-        None => default,
-        Some(s) => match s.parse::<i32>() {
-            Ok(n) => n,
-            Err(_) => default,
-        },
-    }
+fn print_allocs() -> Box<dyn FnMut(&[u8]) + Send> {
+    Box::new(|x| {
+        let event = unsafe { ptr::read(x.as_ptr() as *const alloc_info_t) };
+        println!("{:?}", event);
+    })
+}
+
+fn _print_stack_traces() -> Box<dyn FnMut(&[u8]) + Send> {
+    Box::new(|_x| unimplemented!())
+}
+
+fn print_combined_allocs() -> Box<dyn FnMut(&[u8]) + Send> {
+    Box::new(|x| {
+        let event = unsafe { ptr::read(x.as_ptr() as *const combined_alloc_info_t) };
+        println!("{:?}", event);
+    })
 }
 
 fn run_command_get_pid(cmd: &str) -> Result<u32> {
@@ -209,7 +236,25 @@ fn run_command_get_pid(cmd: &str) -> Result<u32> {
         .id())
 }
 
-const bpf_source: &'static str = r#"
+// for bpf.trace_fields()
+const _TRACEFS: &'static str = "/sys/kernel/debug/tracing";
+
+#[repr(C)]
+#[derive(Debug)]
+struct alloc_info_t {
+    size: u64,
+    timestamp_ns: u64,
+    stack_id: i32,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct combined_alloc_info_t {
+    total_size: u64,
+    number_of_allocs: u64,
+}
+
+const BPF_SOURCE: &'static str = r#"
 #include <uapi/linux/ptrace.h>
 
 struct alloc_info_t {

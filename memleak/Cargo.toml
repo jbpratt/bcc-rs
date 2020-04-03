@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 bcc = "0.0.17"
+bcc-sys = "0.13.0"
 ctrlc = { version = "3.0", features = ["termination"] }
 anyhow = "1.0"
 clap = "2.33.0"
